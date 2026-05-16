@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.ai_analyzer import analyze_email
 from app.email_client import fetch_unseen_emails
 from app.email_parser import ParsedEmail
+from app.mail_sender import send_reply
 from app.models import StoredEmail
 
 
@@ -42,14 +43,19 @@ def save_email_analysis(
     return email_row
 
 
-def process_and_store_new_emails(db: Session) -> int:
+def process_new_emails(db: Session) -> int:
     """
-    Fetch unread emails, analyze them, and store the results.
+    Run one inbox processing cycle.
 
-    Reply sending is intentionally handled in a later step.
+    Steps:
+    1. Fetch unread emails.
+    2. Skip emails that already exist in the database.
+    3. Analyze each email with AI.
+    4. Store the analysis result.
+    5. Send a reply only when the analysis explicitly requires it.
     """
     new_emails = fetch_unseen_emails()
-    logger.info("Emails queued for analysis: %d", len(new_emails))
+    logger.info("Emails queued for processing: %d", len(new_emails))
 
     processed_count = 0
 
@@ -74,7 +80,25 @@ def process_and_store_new_emails(db: Session) -> int:
             )
             continue
 
-        save_email_analysis(db, parsed_email, analysis)
+        email_row = save_email_analysis(db, parsed_email, analysis)
         processed_count += 1
+
+        if email_row.should_reply and email_row.reply_text:
+            try:
+                send_reply(parsed_email, email_row.reply_text)
+
+                email_row.reply_sent = True
+                db.add(email_row)
+                db.commit()
+
+                logger.info("Reply sent for email: %s", parsed_email.message_id)
+
+            except Exception as error:
+                db.rollback()
+                logger.error(
+                    "Reply sending failed for %s: %s",
+                    parsed_email.message_id,
+                    error,
+                )
 
     return processed_count
